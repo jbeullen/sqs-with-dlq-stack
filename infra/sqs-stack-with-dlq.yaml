@@ -1,0 +1,274 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Notification Scheduler
+Parameters:
+  Environment:
+    AllowedValues:
+      - dev
+      - prod
+    Description: Environment of the application
+    Type: String
+    Default: dev
+  ProjectName:
+    Description: Name of the project
+    Type: String
+    AllowedPattern: '[a-zA-Z0-9-]+'
+    ConstraintDescription: must only contain upper- and lowercase letters, numbers and dashes
+    Default: poc
+  ApplicationName:
+    Description: Name of the application
+    Type: String
+    AllowedPattern: '[a-zA-Z0-9-]+'
+    ConstraintDescription: must only contain upper- and lowercase letters, numbers and dashes
+    Default: sqs-with-dlq
+  DeploymentBucketName:
+    Type: String
+    AllowedPattern: '[a-zA-Z0-9-]+'
+    ConstraintDescription: must only contain upper- and lowercase letters, numbers and dashes
+    Default: upgrade-it-deployment
+  DeploymentApplicationRootPath:
+    Type: String
+    AllowedPattern: ([a-zA-Z0-9-]+/?)+
+    ConstraintDescription: must only contain lowercase letters, numbers and dashes
+    Default: applications
+  Version:
+    Type: String
+    Default: 1.0.0-SNAPSHOT
+Resources:
+  # ---------- Notification Queues ----------
+  MessageQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${ProjectName}-${ApplicationName}-${Environment}-message-queue
+      DelaySeconds: 0
+      VisibilityTimeout: 30
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt MessageDLQ.Arn
+        maxReceiveCount: 5
+      Tags:
+        - Key: Project
+          Value: !Sub ${ProjectName}
+        - Key: Application
+          Value: !Sub ${ApplicationName}
+  MessageDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${ProjectName}-${ApplicationName}-${Environment}-message-dlq
+      Tags:
+        - Key: Project
+          Value: !Sub ${ProjectName}
+        - Key: Application
+          Value: !Sub ${ApplicationName}
+
+  # ---------- Error ----------
+  ErrorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-${ApplicationName}-${Environment}-error-function
+      Handler: org.springframework.cloud.function.adapter.aws.FunctionInvoker::handleRequest
+      Runtime: java8
+      MemorySize: 512
+      Timeout: 25
+      Role: !GetAtt ErrorRole.Arn
+      Code:
+        S3Bucket: !Sub ${DeploymentBucketName}
+        S3Key: !Sub ${DeploymentApplicationRootPath}/${ProjectName}-${ApplicationName}/${Version}/lambda/error-${Version}-aws.jar
+      Environment:
+        Variables:
+          SPRING_PROFILES_ACTIVE: !Sub ${Environment}
+      Tags:
+        - Key: Project
+          Value: !Sub ${ProjectName}
+        - Key: Application
+          Value: !Sub ${ApplicationName}
+  ErrorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${ApplicationName}-${Environment}-error-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: lambda.amazonaws.com
+      Policies:
+        - PolicyName: !Sub ${ProjectName}-${ApplicationName}-${Environment}-error-basic-lambda-execution-policy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-${ApplicationName}-${Environment}-error-function:*
+        - PolicyName: !Sub ${ProjectName}-${ApplicationName}-${Environment}-error-queue-policy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:DeleteMessage
+                  - sqs:ReceiveMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  - !GetAtt MessageDLQ.Arn
+      Tags:
+        - Key: Project
+          Value: !Sub ${ProjectName}
+        - Key: Application
+          Value: !Sub ${ApplicationName}
+  ErrorEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      Enabled: true
+      EventSourceArn: !GetAtt MessageDLQ.Arn
+      FunctionName: !GetAtt ErrorFunction.Arn
+
+  # ---------- Consumer ----------
+  ConsumerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-${ApplicationName}-${Environment}-consumer-function
+      Handler: org.springframework.cloud.function.adapter.aws.FunctionInvoker::handleRequest
+      Runtime: java8
+      MemorySize: 512
+      Timeout: 25
+      Role: !GetAtt ConsumerRole.Arn
+      Code:
+        S3Bucket: !Sub ${DeploymentBucketName}
+        S3Key: !Sub ${DeploymentApplicationRootPath}/${ProjectName}-${ApplicationName}/${Version}/lambda/consumer-${Version}-aws.jar
+      Environment:
+        Variables:
+          SPRING_PROFILES_ACTIVE: !Sub ${Environment}
+      Tags:
+        - Key: Project
+          Value: !Sub ${ProjectName}
+        - Key: Application
+          Value: !Sub ${ApplicationName}
+  ConsumerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${ApplicationName}-${Environment}-consumer-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: lambda.amazonaws.com
+      Policies:
+        - PolicyName: !Sub ${ProjectName}-${ApplicationName}-${Environment}-consumer-basic-lambda-execution-policy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-${ApplicationName}-${Environment}-consumer-function:*
+        - PolicyName: !Sub ${ProjectName}-${ApplicationName}-${Environment}-consumer-queue-policy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:DeleteMessage
+                  - sqs:ReceiveMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  - !GetAtt MessageQueue.Arn
+      Tags:
+        - Key: Project
+          Value: !Sub ${ProjectName}
+        - Key: Application
+          Value: !Sub ${ApplicationName}
+  ConsumerEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      Enabled: true
+      EventSourceArn: !GetAtt MessageQueue.Arn
+      FunctionName: !GetAtt ConsumerFunction.Arn
+
+  # ---------- Producer ----------
+  ProducerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-${ApplicationName}-${Environment}-producer-function
+      Handler: org.springframework.cloud.function.adapter.aws.FunctionInvoker::handleRequest
+      Runtime: java8
+      MemorySize: 512
+      Timeout: 30
+      Role: !GetAtt ProducerRole.Arn
+      Code:
+        S3Bucket: !Sub ${DeploymentBucketName}
+        S3Key: !Sub ${DeploymentApplicationRootPath}/${ProjectName}-${ApplicationName}/${Version}/lambda/producer-${Version}-aws.jar
+      Environment:
+        Variables:
+          SPRING_PROFILES_ACTIVE: !Sub ${Environment}
+      Tags:
+        - Key: Project
+          Value: !Sub ${ProjectName}
+        - Key: Application
+          Value: !Sub ${ApplicationName}
+  ProducerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${ApplicationName}-${Environment}-producer-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: lambda.amazonaws.com
+      Policies:
+        - PolicyName: !Sub ${ProjectName}-${ApplicationName}-${Environment}-producer-basic-lambda-execution-policy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-${ApplicationName}-${Environment}-producer-function:*
+        - PolicyName: !Sub ${ProjectName}-${ApplicationName}-${Environment}-producer-queue-policy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:GetQueueUrl
+                  - sqs:SendMessage
+                Resource: !GetAtt MessageQueue.Arn
+      Tags:
+        - Key: Project
+          Value: !Sub ${ProjectName}
+        - Key: Application
+          Value: !Sub ${ApplicationName}
+
+  ProducerScheduledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${ProjectName}-${ApplicationName}-${Environment}-producer-rule
+      ScheduleExpression: cron(0/1 * * * ? *)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ProducerFunction.Arn
+          Id: TargetProducerFunction
+
+  ProducerRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Ref: ProducerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ProducerScheduledRule.Arn
